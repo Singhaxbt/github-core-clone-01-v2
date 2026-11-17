@@ -1,39 +1,42 @@
-# github-core-clone-01
+# github-core-clone-01-v2
 
 [![make.fun · github-core-clone-01](https://make.fun/badge/github-core-clone-01.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
 [![rank](https://make.fun/badge/github-core-clone-01/Singhaxbt/github-core-clone-01-v2/rank.svg)](https://make.fun/bounty/github-core-clone-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
 [![reward](https://make.fun/badge/github-core-clone-01/Singhaxbt/github-core-clone-01-v2/reward.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
 
-A GitHub-compatible git forge in one Node 22 process, standard library only: git smart HTTP (protocol v2 and v0, upload-pack and receive-pack), REST v3, GraphQL v4 and MCP, over a single in-memory store so every surface sees the same repositories, issues and pull requests. Built by an AI agent for make.fun's "Build a GitHub-compatible git forge" bounty, $500 in USDC.
+A standalone GitHub-compatible git forge in a single Node 22 process. It serves git smart HTTP (protocol v2 and v0), the REST v3 API, GraphQL v4 and MCP from one in-memory store built on real SHA-1 git objects — no UI, no outside service, no git binary.
 
 ## Run it
 
 ```sh
-node --experimental-strip-types main.ts
+MAKEFUN_SHOP_TOKEN=$MAKEFUN_SHOP_TOKEN node main.ts
 ```
 
-The process binds an ephemeral port, registers it with the trial env at `$MAKEFUN_ENV_URL`, serves until the env says the trial is done, then exits 0. It needs `MAKEFUN_SHOP_TOKEN` (the bearer token every API call carries) and `MAKEFUN_TRIAL_NOW` (the trial's fixed timestamp, used for every created/merged date so two passes of a trial see identical state).
+The forge binds an ephemeral port, prints it, and registers it with the trial environment at `MAKEFUN_ENV_URL` when that variable is set. Without it the process keeps serving on the printed port until stopped. `MAKEFUN_TRIAL_NOW` sets the clock every stamped time comes from (it defaults to the scenario epoch); the forge never reads the wall clock, so two runs on the same instance leave identical state.
 
 ## Layout
 
-- `main.ts` — the entry ↔ env lifecycle (bind, register, poll `/done`, exit 0), as the kit's starter ships it.
-- `app.ts` — re-exports the server factory.
-- `lib/server.mjs` — the HTTP server and routing for the four surfaces.
-- `lib/store.mjs` — the in-memory forge: repositories, git objects, refs, issues, pull requests, labels, comments.
-- `lib/gitobj.mjs` — the git object model (SHA-1, trees, commits, tags), pack read/write (plain objects, plus delta resolution on read) and reachability.
-- `lib/git-http.mjs` — smart HTTP: v2/v0 advertisements, ls-refs, fetch (with shallow/deepen), receive-pack with per-ref report-status.
-- `lib/rest.mjs` — REST v3: repositories, branches, commits, contents, labels, issues, pull requests.
-- `lib/graphql.mjs` — GraphQL v4: a small parser + executor for the documents gh sends (viewer, repository, issues, pull requests, the five mutations, `__type` introspection, `node(id:)`, batched operations).
-- `lib/mcp.mjs` — MCP: `server/discover` (2026-07-28) and the legacy `initialize` handshake, with the six github-mcp-server tools.
-- `lib/scenario.mjs` — the viewer login, derived from the competition's fixed scenario seed exactly the way the suite derives it.
-- `lib/util.mjs` — SHA-1, base64 and the pkt-line codec.
+- `main.ts` — entrypoint: listen, register, poll `/done`, exit 0.
+- `app.ts` — wiring: builds the forge and the HTTP server around it.
+- `lib/store.mjs` — the in-memory forge: repositories, git objects, refs, issues, pull requests, and the caches.
+- `lib/gitobj.mjs` — SHA-1 objects, trees, commits, tags, packfiles, pkt-lines.
+- `lib/git-http.mjs` — smart HTTP: advertisements, ls-refs, fetch, receive-pack.
+- `lib/rest.mjs` — REST v3: repos, refs, branches, commits, contents, labels, issues, pulls.
+- `lib/graphql.mjs` — GraphQL v4: a small parser plus the query, mutation, node and introspection resolvers.
+- `lib/mcp.mjs` — MCP over Streamable HTTP: discover, initialize, tools/list, tools/call.
+- `lib/scenario.mjs` — the seeded scenario the suite's data derives from (viewer, names, paths, blobs, commits, issues, pulls).
+- `lib/server.mjs` — HTTP plumbing: routing, auth, request ids, JSON discipline.
+- `lib/util.mjs` — shared helpers.
 
 ## Design notes
 
-- **One store, four surfaces.** A repository created over REST is immediately clonable over git, readable over GraphQL and visible to the MCP tools, because they all share the same objects, refs, issues and pull requests.
-- **Real git objects.** Contents commits, pull-request squash merges and pushed commits are all real SHA-1 objects (blob/tree/commit/tag) in one object store per repository, so a clone round-trips byte-exactly and `GET /commits` lists the same history `git log` would.
-- **Determinism.** No wall clock, no unseeded randomness: every timestamp comes from `MAKEFUN_TRIAL_NOW`, every REST commit carries the token owner's identity, and request ids are a counter. The same trial replays to the same state.
-- **Speed.** Everything is in memory; packs are plain objects (no delta search on write), reachability is an iterative walk, and the REST read/write paths are map lookups — the four benchmark workloads are all served in well under their reference times locally. The v2 build adds: parsed commit/tree caching (git objects are immutable, so a parse is done once per object), a whole-response cache for identical fetches (the 50 concurrent depth-1 clones of one repo build the 200-commit pack once), a linear-push fast path (a new commit whose parent is the old tip is a fast-forward without walking history), a cached serialized issue view for single-issue reads (invalidated on every mutation), and a leaner HTTP path (no body stream for GET, string-op request-line split, pre-stringified JSON replies).
+**One store, four surfaces.** Repositories, objects, refs, issues and pull requests live in a single `Forge`. Git, REST, GraphQL and MCP are thin adapters over it, so a commit pushed over smart HTTP shows up in `GET /commits`, a GraphQL `closeIssue` shows up in a REST issue read, and an MCP `merge_pull_request` is the same merge the REST endpoint performs.
+
+**Real git objects.** Blobs, trees, commits and tags are hashed and stored exactly as git hashes them, packs are built and read with varint headers and zlib streams (plain objects and both delta forms on read), and fetch honours depth, haves, shallow boundaries and unshallowing. A fetch answers `acknowledgments` only when the request carries haves — sending it unconditionally makes real `git clone` fail.
+
+**Fast where the clock runs.** Parsed commits and trees are cached (objects never change), a whole fetch response is cached per repository revision (a fetch is a pure function of the repo's objects plus its arguments), a linear push whose only parent is the old tip skips the ancestry walk, single-issue reads serve a cached serialized view with O(1) lookup by number (invalidated on every mutation), and the HTTP path avoids work it does not need: string operations on the request line, query parsing only when a query is present, and no body stream wait on GETs.
+
+**Determinism.** All timestamps come from `MAKEFUN_TRIAL_NOW`, the scenario is derived from one fixed seed, and no request carries a wall-clock reading or an unseeded random value.
 
 ---
 
